@@ -1,0 +1,9 @@
+# 3.5+ needed for the modern InputSticker shape (format/emoji_list per
+# sticker) used by the /newpack emoji-pack feature -- Bot API 7.2, which
+# aiogram 3.5.0 was the first release to fully support.
+aiogram>=3.5,<4
+fonttools>=4.38
+python-dotenv>=1.0
+
+# Shop feature (catalog / cart / orders) storage -- see db.py.
+aiosqlite>=0.19
