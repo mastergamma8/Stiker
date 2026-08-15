@@ -1300,6 +1300,8 @@ async def cb_admin(callback: CallbackQuery) -> None:
         "(без удаления из витринных паков).\n"
         "/rebuildpacks — дособрать витринные паки, если импорт прервался "
         "(например, из-за ограничения Telegram на частоту запросов).\n"
+        "/clearcatalog — удалить ВЕСЬ каталог и оба витринных пака целиком, "
+        "чтобы загрузить всё заново через /importpack.\n"
         "/freeusers — кто получил бесплатный доступ по промокоду.\n"
         "/revokefree <id> — забрать бесплатный доступ у пользователя.\n"
         "/stats — статистика заказов."
@@ -1528,6 +1530,100 @@ async def cb_admin_delete_confirm(callback: CallbackQuery, bot: Bot) -> None:
     full = await db.get_catalog_item(items[idx]["id"])
     if full is not None:
         await _send_admin_item_card(bot, chat_id, full, idx, len(items))
+
+
+@router.message(Command("clearcatalog"))
+async def cmd_clearcatalog(message: Message) -> None:
+    """Bulk counterpart to /catalog's one-at-a-time 🗑 Удалить -- wipes the
+    ENTIRE catalog plus both live showcase Telegram packs in one go, so
+    the admin can start over with a fresh /importpack instead of clicking
+    🗑 on every item individually. Same two-step confirm pattern as the
+    single-item delete (cb_admin_delete_prompt/-confirm), just scaled up:
+    the warning spells out exactly how many items and which two packs are
+    about to disappear, since there's no per-item card to review first."""
+    if not is_admin(message.from_user.id):
+        return
+    total = await db.count_catalog_items(active_only=False)
+    sp_name = await db.get_setting("sticker_pack_name")
+    ep_name = await db.get_setting("emoji_pack_name")
+    if not total and not sp_name and not ep_name:
+        await message.answer("Каталог и так пуст. /importpack — загрузить пак.")
+        return
+
+    lines = [
+        f"⚠️ Это удалит ВСЮ витрину: {total} позиций каталога и оба "
+        "витринных пака целиком из Telegram. Необратимо — отменить не "
+        "получится, в отличие от /removeitem."
+    ]
+    if sp_name:
+        lines.append(f"Стикеры: https://t.me/addstickers/{sp_name}")
+    if ep_name:
+        lines.append(f"Эмодзи: https://t.me/addemoji/{ep_name}")
+    lines.append("После очистки — сразу /importpack, чтобы загрузить каталог заново.")
+
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        InlineKeyboardButton(text="✅ Да, удалить всё", callback_data="shop:clearyes"),
+        InlineKeyboardButton(text="↩️ Отмена", callback_data="shop:clearno"),
+    )
+    await message.answer("\n".join(lines), reply_markup=kb.as_markup())
+
+
+@router.callback_query(F.data == "shop:clearno")
+async def cb_clear_cancel(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Только для администратора.", show_alert=True)
+        return
+    await callback.answer("Отменено")
+    try:
+        await callback.message.edit_text("Отменено, каталог не тронут.")
+    except TelegramBadRequest:
+        pass
+
+
+@router.callback_query(F.data == "shop:clearyes")
+async def cb_clear_confirm(callback: CallbackQuery, bot: Bot) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Только для администратора.", show_alert=True)
+        return
+    await callback.answer("Удаляю…")
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except TelegramBadRequest:
+        pass
+
+    # Re-read fresh rather than trusting anything captured when the
+    # confirmation prompt was first shown -- mirrors why
+    # cb_admin_delete_confirm re-fetches the item instead of trusting the
+    # callback payload.
+    sp_name = await db.get_setting("sticker_pack_name")
+    ep_name = await db.get_setting("emoji_pack_name")
+
+    warnings: list[str] = []
+    if sp_name:
+        try:
+            await bot.delete_sticker_set(name=sp_name)
+        except Exception:
+            log.warning("delete_sticker_set (showcase sticker pack %s) failed", sp_name, exc_info=True)
+            warnings.append(f"не получилось удалить витринный стикер-пак «{sp_name}» в Telegram")
+    if ep_name:
+        try:
+            await bot.delete_sticker_set(name=ep_name)
+        except Exception:
+            log.warning("delete_sticker_set (showcase emoji pack %s) failed", ep_name, exc_info=True)
+            warnings.append(f"не получилось удалить витринный эмодзи-пак «{ep_name}» в Telegram")
+
+    deleted_n = await db.clear_catalog()
+    for key in ("sticker_pack_name", "emoji_pack_name", "sticker_pack_count", "emoji_pack_count"):
+        await db.delete_setting(key)
+
+    note = f"🗑 Каталог очищен: удалено позиций — {deleted_n}, витринные паки удалены."
+    if warnings:
+        note += ("\n⚠️ " + "; ".join(warnings) +
+                 " (сами стикеры там могли остаться, но каталог их больше не знает "
+                 "-- при желании уберите пак(и) вручную через @Stickers)")
+    note += "\n\n/importpack — загрузить каталог заново."
+    await bot.send_message(callback.message.chat.id, note)
 
 
 async def _toggle_active(message: Message, active: bool) -> None:
