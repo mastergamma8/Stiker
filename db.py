@@ -338,6 +338,24 @@ async def delete_catalog_item(item_id: int) -> bool:
         return cur.rowcount > 0
 
 
+async def clear_catalog() -> int:
+    """Permanently wipes EVERY catalog item at once (irreversible) -- the
+    bulk counterpart to delete_catalog_item, used by /clearcatalog to
+    reset the whole shop before a fresh /importpack. Same division of
+    responsibility as the single-item delete: callers must remove the two
+    live showcase Telegram packs themselves *first* (see shop.py's
+    cb_clear_confirm) -- this call only touches the database. cart_items
+    referencing any of these items are cleared automatically (ON DELETE
+    CASCADE, see schema). Past orders are left untouched on purpose --
+    they're historical receipts for stickers already generated and
+    delivered, not live catalog state, so wiping the catalog shouldn't
+    erase them. Returns how many items were deleted."""
+    async with _connect() as conn:
+        cur = await conn.execute("DELETE FROM catalog_items")
+        await conn.commit()
+        return cur.rowcount
+
+
 # ---------------------------------------------------------------------------
 # Settings (key-value)
 # ---------------------------------------------------------------------------
@@ -356,6 +374,19 @@ async def set_setting(key: str, value: str) -> None:
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (key, value),
         )
+        await conn.commit()
+
+
+async def delete_setting(key: str) -> None:
+    """Removes a settings row entirely (rather than overwriting it with
+    an empty string), so a later get_setting(key) falls back to its
+    `default` again. Used by /clearcatalog for sticker_pack_name/
+    emoji_pack_name: build_or_extend_set treats any non-None
+    existing_name as "extend this set", so leaving "" behind would make
+    it try to extend a set literally named "" instead of creating a
+    fresh one -- it has to be genuinely absent."""
+    async with _connect() as conn:
+        await conn.execute("DELETE FROM settings WHERE key = ?", (key,))
         await conn.commit()
 
 
