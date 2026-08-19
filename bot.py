@@ -529,7 +529,7 @@ async def _add_sticker_to_pack(message: Message, state: FSMContext, raw: bytes, 
         if pack_name is None:
             bot_username = await sticker_sets.get_bot_username(bot)
             pack_name = await sticker_sets.create_set_with_retry(
-                bot, user_id, title, input_sticker, "custom_emoji", bot_username
+                bot, user_id, title, [input_sticker], "custom_emoji", bot_username
             )
         else:
             await bot.add_sticker_to_set(user_id=user_id, name=pack_name, sticker=input_sticker)
