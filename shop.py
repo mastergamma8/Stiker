@@ -76,6 +76,17 @@ router = Router(name="shop")
 # with TGS_BOT_PLACEHOLDER_TEXT if you'd rather use something else.
 PLACEHOLDER_TEXT = os.getenv("TGS_BOT_PLACEHOLDER_TEXT", "TEXT")
 
+# Default catalog display name -- shown in the /start greeting ("Это
+# каталог «...»") and used as the actual Telegram *title* for the two
+# showcase packs (see _rebuild_template_packs) whenever no catalog_title
+# has been explicitly set via `/importpack <название>`. Deliberately a
+# separate constant from PLACEHOLDER_TEXT above: that one is the literal
+# word baked into every demo sticker's artwork, this one is just the
+# catalog's own name -- they used to share a value by coincidence, which
+# is why the bot used to introduce itself as "TEXT". Override with
+# TGS_BOT_CATALOG_TITLE if you'd rather use something else.
+CATALOG_TITLE_DEFAULT = os.getenv("TGS_BOT_CATALOG_TITLE", "SD CATALOG")
+
 # Comma-separated Telegram numeric user IDs allowed to import/price/manage
 # the catalog. TGS_BOT_ADMIN_IDS overrides this when set (see .env.example);
 # the literal default below exists so admin access works out of the box
@@ -234,7 +245,7 @@ async def _show_main_menu(bot: Bot, chat_id: int, user_id: int) -> None:
                 "стикер-пака (форвардните его сюда) — импортирую весь пак: "
                 f"сделаю демо-версию с текстом «{PLACEHOLDER_TEXT}» для "
                 "каждого стикера, соберу из них стикер-пак и эмодзи-пак с "
-                f"названием «{PLACEHOLDER_TEXT}», и открою каталог для всех "
+                f"названием «{CATALOG_TITLE_DEFAULT}», и открою каталог для всех "
                 f"по фиксированной цене {PRICE_STARS}⭐ за штуку.\n\n"
                 "Либо команда /importpack [название].",
             )
@@ -258,7 +269,7 @@ async def _show_main_menu(bot: Bot, chat_id: int, user_id: int) -> None:
         kb.row(InlineKeyboardButton(text="✏️ Свой стикер (ручной режим)", callback_data="shop:manual"))
         kb.row(InlineKeyboardButton(text="⚙️ Админ-панель", callback_data="shop:admin"))
 
-    catalog_title = await db.get_setting("catalog_title", PLACEHOLDER_TEXT)
+    catalog_title = await db.get_setting("catalog_title", CATALOG_TITLE_DEFAULT)
     await send_stars(
         bot, chat_id,
         f"Привет! 👋 Это каталог «{catalog_title}» — {n} стикеров и "
@@ -1058,7 +1069,6 @@ async def handle_import_sticker(message: Message, state: FSMContext, bot: Bot) -
         report_lines.append(f"Пропущено (ошибка обработки): {skipped_error}")
     await message.answer("\n".join(report_lines))
 
-    await message.answer("Собираю/дособираю превью-паки в Telegram (это не быстро, Telegram ограничивает частоту запросов)…")
     await _rebuild_template_packs(bot, message.from_user.id, notify_chat_id=message.chat.id)
 
     links = []
@@ -1140,6 +1150,27 @@ def _make_wait_notifier(bot: Bot, chat_id: int | None, *, min_seconds_to_notify:
     return on_wait
 
 
+def _estimate_batch_minutes(pending_counts: list[int]) -> tuple[int, int]:
+    """Rough wall-clock (low, high) minutes estimate for building/
+    extending showcase packs, given how many items are pending for each
+    pack type. The first <=50 items per pack now go in a single batched
+    createNewStickerSet call (see sticker_sets.py) -- normally a couple of
+    minutes even accounting for the odd flood-control wait. Only the
+    *overflow* past 50 per pack still needs one paced addStickerToSet
+    call per item, which is where real time comes from; that part is
+    calibrated against real observed runs of the old one-by-one code
+    (~30-40 min for a ~30-item single-pack batch) rather than just the
+    fixed STICKER_API_DELAY, since Telegram's own flood-control waits
+    dominate the total far more than the base pacing does. Deliberately a
+    wide range, not false precision."""
+    overflow = sum(max(0, n - 50) for n in pending_counts)
+    if overflow == 0:
+        return (1, 5)
+    low = max(1, round(overflow * 1.0))
+    high = max(low + 1, round(overflow * 1.5))
+    return (low, high)
+
+
 async def _rebuild_template_packs(bot: Bot, admin_user_id: int, *, notify_chat_id: int | None = None) -> None:
     """(Re)builds the two browsable "template" packs (regular stickers +
     custom emoji, both showing PLACEHOLDER_TEXT) from the full active
@@ -1170,9 +1201,8 @@ async def _rebuild_template_packs(bot: Bot, admin_user_id: int, *, notify_chat_i
     /rebuildpacks after an interruption would have no way to know how far
     a still-running or cut-short attempt actually got."""
     await _backfill_showcase_file_ids(bot)
-    on_wait = _make_wait_notifier(bot, notify_chat_id)
     items = await db.list_catalog_light(active_only=True)
-    title = await db.get_setting("catalog_title", PLACEHOLDER_TEXT)
+    title = await db.get_setting("catalog_title", CATALOG_TITLE_DEFAULT)
 
     sticker_pack_name = await db.get_setting("sticker_pack_name")
     emoji_pack_name = await db.get_setting("emoji_pack_name")
@@ -1183,6 +1213,28 @@ async def _rebuild_template_packs(bot: Bot, admin_user_id: int, *, notify_chat_i
     emoji_room = max(0, sticker_sets.MAX_CUSTOM_EMOJI - emoji_have)
     to_add_sticker = [i for i in items if not i["showcase_sticker_file_id"]][:sticker_room]
     to_add_emoji = [i for i in items if not i["showcase_emoji_file_id"]][:emoji_room]
+
+    if (to_add_sticker or to_add_emoji) and notify_chat_id is not None:
+        low, high = _estimate_batch_minutes([len(to_add_sticker), len(to_add_emoji)])
+        try:
+            await bot.send_message(
+                notify_chat_id,
+                f"Начинаю: {len(to_add_sticker)} шт. в стикер-пак, {len(to_add_emoji)} "
+                f"шт. в эмодзи-пак. Telegram ограничивает частоту создания "
+                f"стикеров, так что это не мгновенно — ориентировочно {low}-{high} "
+                "мин. Если Telegram попросит паузу, подожду сам и повторю; "
+                "отдельно писать об этом не буду (детали в логах, если интересно) "
+                "— просто дождитесь ссылок в конце.",
+            )
+        except Exception:
+            log.warning("start-notify message failed", exc_info=True)
+
+    # Flood-control waits are already logged in detail by
+    # sticker_sets._call_with_flood_retry -- no need to also relay each one
+    # to chat here. That used to fire every ~20s during a big import and
+    # was pure noise on top of the logs; the estimate above already sets
+    # the right expectation up front.
+    on_wait = None
 
     bot_username = await sticker_sets.get_bot_username(bot)
 
@@ -1709,4 +1761,4 @@ async def cmd_revokefree(message: Message) -> None:
     await message.answer(
         f"Готово, забрал бесплатный доступ у #{target_id}." if ok
         else f"У #{target_id} и так не было бесплатного доступа."
-    )
+  )
