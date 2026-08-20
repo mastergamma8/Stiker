@@ -29,15 +29,26 @@ or back off on your own schedule.
 
 Since Bot API 7.2, createNewStickerSet itself accepts 1-50 *initial*
 stickers in a single call (not just one) -- build_or_extend_set below
-uses this to create a set's first <=50 items in ONE call instead of
-createNewStickerSet(1) + up to 49*addStickerToSet(1), which is where
-nearly all of a big import's wall-clock time and flood-control risk used
-to come from. If that batched call itself gets rejected (one bad file
-anywhere in the batch is enough -- Telegram doesn't say which one), it
-falls back to the original one-by-one path, so nothing is lost in the
-worst case, just slower. Anything beyond the first 50 (a pack growing
-past that) still goes through addStickerToSet one at a time -- there's
-no batch "add to existing set" call, only a batch "create" call.
+uses this to create a set's first batch in ONE call instead of
+createNewStickerSet(1) + one addStickerToSet per remaining sticker, which
+is where nearly all of a big import's wall-clock time used to come from.
+
+That batch defaults to 12, not Telegram's max of 50 -- a real production
+run on 2026-08-20 showed a single 37-sticker batch tripping flood control
+on its very first attempt (a TelegramRetryAfter of several minutes),
+suggesting Telegram weighs a createNewStickerSet call's flood-control
+cost by how many stickers are inside it, not just by "one request". A
+smaller batch both has a better chance of clearing at all and wastes less
+time before falling back if it doesn't. If the batch call gets rejected
+for a bad file (Telegram doesn't say which one), it falls back to the
+one-by-one path, so nothing is lost, just slower. If it gets rejected by
+flood control instead, it does NOT fall back or retry -- see
+create_set_with_retry's docstring for why that specific combination (new
+name + wait, repeated) is what turned one blocked call into 5 blocked
+calls in a row (48 minutes of sleeping) before crashing the whole update
+handler that day. Anything beyond the initial batch (a pack growing past
+it) still goes through addStickerToSet one at a time -- there's no batch
+"add to existing set" call, only a batch "create" call.
 
 Kept out of pack_builder.py on purpose -- that module stays aiogram-free,
 see its own docstring -- and out of bot.py so shop.py doesn't have to
@@ -150,12 +161,16 @@ async def create_set_with_retry(
     generated name colliding with an existing set somewhere on Telegram --
     short names are global, not per-bot, so this is expected to happen
     occasionally for common titles). Flood control (TelegramRetryAfter) is
-    waited out via _call_with_flood_retry and doesn't consume a naming
-    attempt, since a new name wouldn't fix that. Any other error (bad
-    title, a bad file somewhere in `stickers`, etc.) is not retried and
-    propagates immediately, since neither a new name nor a wait would --
-    build_or_extend_set is what decides whether to retry with a smaller
-    batch in that case, not this function."""
+    waited out via _call_with_flood_retry; if it's *still* not resolved
+    after that (Telegram remaining in a flood-control state through its
+    own reported retry_after), this propagates immediately rather than
+    burning through the remaining naming attempts -- a new name cannot
+    fix a rate limit, and retrying it anyway is what turned one blocked
+    call into 5 blocked calls in a row on 2026-08-20. Any other error
+    (bad title, a bad file somewhere in `stickers`, etc.) is also not
+    retried and propagates immediately, since neither a new name nor a
+    wait would help -- build_or_extend_set is what decides whether to
+    retry with a smaller batch in that case, not this function."""
     bot_username = bot_username or await get_bot_username(bot)
     last_err: Exception | None = None
     for attempt in range(attempts):
@@ -178,11 +193,6 @@ async def create_set_with_retry(
             if any(k in text for k in ("occupied", "already", "short_name", "shortname")):
                 continue
             raise
-        except TelegramRetryAfter as e:
-            # Exhausted the flood-control retry budget for this name --
-            # try a fresh attempt/name rather than looping on it forever.
-            last_err = e
-            continue
     raise last_err
 
 
@@ -214,10 +224,11 @@ async def build_or_extend_set(
 
     `on_progress`, if given, is awaited with (name, current_count) after
     every successful create/add call -- not just once at the end. That's
-    one call for up to the first 50 stickers (see the batched fast path
-    below), then one per sticker beyond that. A big batch with several
-    flood-control waits can take many minutes, and the caller (see
-    shop.py's _rebuild_template_packs) uses this to persist
+    one call for the initial batch (see the batched fast path below, size
+    controlled by TGS_BOT_STICKER_BATCH_SIZE), then one per sticker beyond
+    that. A big batch with several flood-control waits can take many
+    minutes, and the caller (see shop.py's _rebuild_template_packs) uses
+    this to persist
     sticker_pack_name/sticker_pack_count to the settings table right away
     each time, rather than only after this whole function returns. That's
     what makes /stats show real progress mid-batch, and -- more
@@ -239,13 +250,19 @@ async def build_or_extend_set(
 
     Returns (name, added, skipped, added_file_ids):
       - name is None only if nothing could be added at all (set already
-        full, or Telegram rejected every candidate).
-      - skipped counts stickers dropped either because the set's Telegram
-        size cap (see max_for()) was already reached, because Telegram
-        rejected that specific file, or because flood control never
-        cleared within MAX_RETRY_AFTER_ATTEMPTS waits -- logged in all
-        three cases, but doesn't abort the rest of the batch, since one
-        bad/unlucky sticker shouldn't cost the other 49.
+        full, Telegram rejected every candidate, or flood control never
+        cleared -- see below).
+      - skipped counts stickers dropped for any of three reasons: the
+        set's Telegram size cap (see max_for()) was already reached,
+        Telegram rejected that specific file (logged, doesn't abort the
+        rest -- one bad/unlucky sticker shouldn't cost the others), or
+        flood control never cleared within MAX_RETRY_AFTER_ATTEMPTS waits
+        on some call -- unlike a bad file, this DOES abort everything not
+        yet attempted (counted into skipped in bulk) rather than trying
+        the next candidate, since a still-active flood block will almost
+        certainly hit the next call too, and finding that out costs
+        another multi-minute wait per attempt (see the module docstring's
+        2026-08-20 incident).
       - added_file_ids is [] whenever `keys` wasn't passed, nothing was
         added, or the closing getStickerSet call itself failed (logged,
         not raised -- the pack build already succeeded at that point, so
@@ -273,18 +290,41 @@ async def build_or_extend_set(
     )
     succeeded_keys: list[Any] = []
 
+    # Cap on the *initial* createNewStickerSet batch -- Telegram's own hard
+    # limit on that call is 50, but a real production run on 2026-08-20
+    # showed a single 37-sticker batch tripping flood control on its very
+    # first attempt (a multi-minute TelegramRetryAfter), suggesting
+    # Telegram weighs this call's flood-control cost by how many stickers
+    # are inside it, not just by "one request" -- so a smaller batch has a
+    # better chance of clearing at all, and a failed one wastes less time
+    # before falling back. Override with TGS_BOT_STICKER_BATCH_SIZE if you
+    # want to experiment; keep at or below 50.
+    batch_cap = min(50, int(os.getenv("TGS_BOT_STICKER_BATCH_SIZE", "12")))
+
     if name is None:
         if current_count >= cap:
             return None, 0, len(remaining), []
 
-        # Fast path: Telegram accepts up to 50 *initial* stickers in one
-        # createNewStickerSet call, so try to open the set with as big a
-        # batch as fits (room in the set, Telegram's own 50 cap on this
-        # call, and however many candidates there actually are) instead of
-        # one sticker + N individually-paced addStickerToSet calls. For a
-        # catalog of <=50 items -- the common case -- this alone turns the
-        # whole set into existence in a single request.
-        batch_size = min(50, cap - current_count, len(remaining))
+        # Fast path: Telegram accepts multiple *initial* stickers in one
+        # createNewStickerSet call (up to 50), so try to open the set with
+        # a batch instead of one sticker + N individually-paced
+        # addStickerToSet calls -- far fewer round trips when it works.
+        #
+        # If Telegram is currently flood-limiting this bot's sticker-set
+        # calls, it stays limited regardless of which name or how small a
+        # follow-up request is -- see create_set_with_retry's docstring on
+        # 2026-08-20's incident, where retrying with a new name 5 times in
+        # a row just repeated the same multi-minute block 5 times before
+        # crashing the whole update handler. So: a flood-control failure
+        # here does NOT fall through to the one-by-one path below (that
+        # would almost certainly hit the exact same wall immediately) --
+        # it gives up cleanly for this run instead, and the caller (see
+        # shop.py's _rebuild_template_packs) tells the admin to just try
+        # /rebuildpacks again later. A rejected *file* (TelegramBadRequest)
+        # is a different, per-content problem, so that one still falls
+        # back to one-by-one as before.
+        flood_blocked = False
+        batch_size = min(batch_cap, cap - current_count, len(remaining))
         if batch_size > 1:
             batch = remaining[:batch_size]
             batch_keys = [k for k, _ in batch]
@@ -306,13 +346,23 @@ async def build_or_extend_set(
                 # losing the rest. `remaining` is untouched above, so
                 # nothing here has been lost.
                 log.warning("batched createNewStickerSet rejected (falling back to one-by-one): %s", e)
+            except TelegramRetryAfter as e:
+                log.warning(
+                    "batched createNewStickerSet still flood-limited after Telegram's own "
+                    "retry_after (last: %ss) -- giving up on this run rather than retrying "
+                    "(see create_set_with_retry docstring)", e.retry_after,
+                )
+                flood_blocked = True
 
-        if name is None:
+        if name is None and not flood_blocked:
             # Either batching didn't apply (batch_size <= 1) or the batch
-            # attempt above failed. Find the first sticker Telegram will
-            # actually accept to create the set -- if the very first
-            # candidate is rejected, try the next one rather than aborting
-            # the whole batch.
+            # attempt above failed on a bad file. Find the first sticker
+            # Telegram will actually accept to create the set -- if the
+            # very first candidate is rejected for being bad, try the next
+            # one rather than aborting the whole batch. But a flood-control
+            # hit here, same as above, ends the search immediately instead
+            # of grinding through every remaining candidate at multi-minute
+            # cost each.
             while remaining:
                 key, candidate = remaining.pop(0)
                 try:
@@ -328,8 +378,17 @@ async def build_or_extend_set(
                 except TelegramBadRequest as e:
                     log.warning("createNewStickerSet rejected a sticker: %s", e)
                     skipped += 1
-            if name is None:
-                return None, added, skipped, []
+                except TelegramRetryAfter as e:
+                    log.warning(
+                        "still flood-limited on a single sticker after Telegram's own "
+                        "retry_after (last: %ss) -- giving up on this run", e.retry_after,
+                    )
+                    flood_blocked = True
+                    break
+
+        if name is None:
+            skipped += len(remaining)
+            return None, added, skipped, []
 
     for i, (key, sticker) in enumerate(remaining):
         if current_count >= cap:
@@ -348,11 +407,19 @@ async def build_or_extend_set(
             log.warning("addStickerToSet rejected a sticker: %s", e)
             skipped += 1
         except TelegramRetryAfter as e:
+            # Same reasoning as the create phase above: _call_with_flood_retry
+            # already waited out Telegram's own reported retry_after and it's
+            # STILL blocked, so the next item would almost certainly hit the
+            # identical wall immediately. Stop here (counting everything not
+            # yet tried as skipped) instead of repeating a multi-minute wait
+            # once per remaining sticker.
             log.error(
-                "giving up on a sticker after %s flood-control waits (last wait: %ss)",
-                MAX_RETRY_AFTER_ATTEMPTS, e.retry_after,
+                "giving up on the rest of this batch after %s flood-control waits on "
+                "one sticker (last wait: %ss) -- %s items left untried",
+                MAX_RETRY_AFTER_ATTEMPTS, e.retry_after, len(remaining) - i - 1,
             )
-            skipped += 1
+            skipped += len(remaining) - i
+            break
         await asyncio.sleep(STICKER_API_DELAY)
 
     added_file_ids: list[tuple[Any, str]] = []
