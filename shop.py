@@ -1246,6 +1246,16 @@ async def _rebuild_template_packs(bot: Bot, admin_user_id: int, *, notify_chat_i
         await db.set_setting("emoji_pack_name", name)
         await db.set_setting("emoji_pack_count", str(count))
 
+    # Collects a short note per pack type when a build attempt makes zero
+    # progress despite having pending items -- almost always persistent
+    # Telegram-side flood control giving up cleanly (see
+    # build_or_extend_set's docstring on the 2026-08-20 incident) rather
+    # than a content problem, which would still get *something* in via the
+    # one-by-one fallback. Without this, a fully-blocked run leaves the
+    # admin with no links, no error, and no idea why -- exactly what
+    # happened that day.
+    stalled_notes: list[str] = []
+
     if to_add_sticker:
         rows = [await db.get_catalog_item(i["id"]) for i in to_add_sticker]
         rows = [r for r in rows if r is not None]
@@ -1262,6 +1272,13 @@ async def _rebuild_template_packs(bot: Bot, admin_user_id: int, *, notify_chat_i
         if name:
             await db.set_setting("sticker_pack_name", name)
             await db.set_setting("sticker_pack_count", str(sticker_have + added))
+        if not added:
+            stalled_notes.append(
+                "стикер-пак: не добавилось ни одного из "
+                f"{len(to_add_sticker)} — похоже, Telegram сейчас жёстко "
+                "ограничивает создание/дополнение паков. Каталог не тронут, "
+                "попробуйте /rebuildpacks минут через 15-20."
+            )
         for item_id, file_id in added_fids:
             await db.set_showcase_file_id(item_id, "sticker", file_id)
 
@@ -1281,8 +1298,19 @@ async def _rebuild_template_packs(bot: Bot, admin_user_id: int, *, notify_chat_i
         if name:
             await db.set_setting("emoji_pack_name", name)
             await db.set_setting("emoji_pack_count", str(emoji_have + added))
+        if not added:
+            stalled_notes.append(
+                "эмодзи-пак: не добавилось ни одного из "
+                f"{len(to_add_emoji)} — та же причина, см. выше."
+            )
         for item_id, file_id in added_fids:
             await db.set_showcase_file_id(item_id, "emoji", file_id)
+
+    if stalled_notes and notify_chat_id is not None:
+        try:
+            await bot.send_message(notify_chat_id, "⚠️ " + "\n".join(stalled_notes))
+        except Exception:
+            log.warning("stalled-build notice failed to send", exc_info=True)
 
 
 async def _backfill_showcase_file_ids(bot: Bot) -> None:
@@ -1761,4 +1789,4 @@ async def cmd_revokefree(message: Message) -> None:
     await message.answer(
         f"Готово, забрал бесплатный доступ у #{target_id}." if ok
         else f"У #{target_id} и так не было бесплатного доступа."
-  )
+    )
